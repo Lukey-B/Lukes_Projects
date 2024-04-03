@@ -1,0 +1,62 @@
+# AD SCRAPER
+
+import json
+import boto3
+import pandas as pd
+from io import StringIO
+import awswrangler as wr
+from functions import delete_from_s3
+from functions import update_ad_details
+from decimal import Decimal 
+import time
+
+# Initialize a boto3 client for S3
+s3_client = boto3.client('s3')
+# ddb = boto\.resource("dynamodb")
+
+def lambda_handler(event, context):
+    start_time = time.time()  # Start time of the Lambda execution
+    time_limit = 840  # 14 minutes in seconds, as a soft limit
+
+    bucket_name = event['Records'][0]['s3']['bucket']['name']
+    object_key = event['Records'][0]['s3']['object']['key']
+
+    # Fetch the CSV object from S3
+    response = s3_client.get_object(Bucket=bucket_name, Key=object_key)
+    listings_df = pd.read_csv(StringIO(response['Body'].read().decode('utf-8')))
+    
+    processed_rows = 0
+    batch_size = 25
+    for start in range(0, len(listings_df), batch_size):
+        if time.time() - start_time > time_limit:  # Check if we're approaching the Lambda time limit
+            print("Approaching the Lambda execution time limit. Saving remaining data for next invocation.")
+            remaining_df = listings_df.iloc[start:]
+            # Save remaining_df to S3 for next processing
+            csv_buffer = StringIO()
+            remaining_df.to_csv(csv_buffer, index=False)
+            s3_client.put_object(Bucket='remaininglistings-1', Key=f'remaining_{object_key}', Body=csv_buffer.getvalue().encode('utf-8'))
+            print('uploaded remaining ads to remaininglistings-1')
+            delete_from_s3(bucket_name, object_key)
+            break  # Exit the loop to stop processing
+
+        end = start + batch_size
+        batch_df = listings_df.iloc[start:end]
+        print(f"{len(listings_df) - processed_rows} Remaining listings to process")
+        updated_batch = batch_df.apply(lambda row: update_ad_details(row), axis=1)
+        new_ads_combined = pd.concat([batch_df, updated_batch], axis=1)
+        
+        for column in new_ads_combined.select_dtypes(include=['float64']).columns:
+            new_ads_combined[column] = new_ads_combined[column].apply(lambda x: Decimal(str(x)) if pd.notnull(x) else None)
+        
+        wr.dynamodb.put_df(df=new_ads_combined, table_name='Time2Price')
+        print("Current batch uploaded to Dynamo")
+        processed_rows += len(batch_df)
+        print(f"{processed_rows} Rows have been processed")
+    
+    if processed_rows == len(listings_df):
+        print("All Ad Details Added")
+        
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Ad Details Added and Original File Deleted Successfully')
+    }
