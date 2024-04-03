@@ -1,0 +1,72 @@
+from functions import main
+from functions import upload_to_s3
+from functions import get_existing_ad_ids
+from functions import update_ad_status
+import pandas as pd
+from datetime import datetime
+
+
+def lambda_handler(event, context):
+   
+    current_time_str = datetime.utcnow().strftime("%Y-%m-%d-%H-%M-%S")
+    
+    lc_lambda_1= {'british-columbia': 9007,
+    'alberta': 9003,
+    'new-brunswick': 9005,
+    'newfoundland': 9008,
+    'prince-edward-island': 9011,
+    'nova-scotia': 9002,
+    'territories': 9010,
+    'markham-york-region': 1700274,
+    'windsor-region': 1700220,
+    'woodstock': 1700241,
+    'oshawa-durham-region': 1700275
+    }
+     
+  
+    table_name = 'Time2Price'
+    bucket_val = 1
+    lam_name = f'lambda_{bucket_val}' # lambda name
+    dest_bucket = f"kijijibucket-{bucket_val}"
+    page_number = 1
+    existing_ad_ids = get_existing_ad_ids(table_name, bucket_val, status ='active')
+    print(f"existing_ad_ids before df filtering {len(existing_ad_ids)}")
+    existing_ad_ids = pd.DataFrame(existing_ad_ids,columns = ["ad_id"])
+    existing_ad_ids['ad_id'] = existing_ad_ids['ad_id'].apply(lambda x: int(x) if pd.notnull(x) else x)
+    print(f"From Dyanmo- existing ads {len(existing_ad_ids)}")
+
+
+    ad_data_all_df = pd.DataFrame()
+
+    for location, location_code in lc_lambda_1.items():
+        print(f"Scraping: {location}")
+        ad_data_region = main(page_number,location, location_code,table_name,bucket_val)
+        ad_data_all_df = pd.concat([ad_data_all_df, ad_data_region], ignore_index=True)
+
+    ad_data_all_df.drop_duplicates(subset=['ad_id'], keep=False,inplace=True)
+    ad_data_all_df['bucket'] = bucket_val
+    print(f"{len(ad_data_all_df)} Ads Scraped")
+    
+    # Find ad_ids that are in scraped_ads but are not in dynamo lambda 1
+    new_ads = ad_data_all_df.loc[~ad_data_all_df['ad_id'].isin(existing_ad_ids['ad_id'])].copy()
+    print(f"There have been {len(new_ads)} new ads posted")
+    
+    # Find ad_ids that are in dynamo but not in scraped ads
+    sold_ads = existing_ad_ids.loc[~existing_ad_ids['ad_id'].isin(ad_data_all_df['ad_id'])].copy()
+    sold_ads_ids = sold_ads["ad_id"]
+    
+    print(f"There are {len(ad_data_all_df)} current listings and {len(new_ads)} of them are new (not found in dyanmo), or {len(ad_data_all_df) - len(new_ads)} id matches")
+    print(f"There are {len(existing_ad_ids)} dynamo id's and {len(existing_ad_ids) - (len(ad_data_all_df) - len(new_ads))} of them were not found in the scrape ( have been sold)")
+    
+    
+    update_ad_status(sold_ads_ids, 'inactive', 'Time2Price', bucket_val)
+    print(f"Updated {len(sold_ads)} inactive ads in DynamoDB")
+    
+    key = f'{lam_name}_scraped_listings_data_{current_time_str}.csv'
+    upload_to_s3(dest_bucket, key,new_ads)
+    
+    return {
+        'statusCode': 200
+    }
+
+
